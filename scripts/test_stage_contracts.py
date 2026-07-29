@@ -187,6 +187,14 @@ def main() -> int:
         card_path = root / "card-01.json"
         write(card_path, card_spec)
         assert validate(ready_design, [content_path, title_path], artifact_path=design_path) == []
+        pipeline_result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "run_pipeline.py"), str(card_path)],
+            text=True,
+            capture_output=True,
+        )
+        assert pipeline_result.returncode == 0, pipeline_result.stderr
+        rendered_qa = json.loads((root / "cover.png.qa.json").read_text(encoding="utf-8"))
+        assert rendered_qa.get("valid") is True
 
         rogue_spec = dict(card_spec)
         rogue_spec["output"] = "rogue-cover.png"

@@ -59,18 +59,26 @@ cd PoemSkills
 python3 scripts/install_skills.py
 ```
 
-安装脚本只创建以下软链接，并拒绝覆盖无关目录：
+安装脚本默认同时安装到 Codex 和 Claude Code，只创建以下软链接，并拒绝覆盖无关目录：
 
 ```text
-~/.codex/skills/poemskills
-~/.codex/skills/poem-content
-~/.codex/skills/poem-title
-~/.codex/skills/poem-design
-~/.codex/skills/poem-render
-~/.codex/skills/poem-review
+~/.codex/skills/{poemskills,poem-content,poem-title,poem-design,poem-render,poem-review}
+~/.claude/skills/{poemskills,poem-content,poem-title,poem-design,poem-render,poem-review}
 ```
 
-重启 Codex 后使用 `$poemskills`。检查安装：
+脚本会在写入前检查两端；若遇到意外写入失败，会保留已经正确创建的链接，直接重跑即可安全补齐。
+
+只装一端：
+
+```bash
+python3 scripts/install_skills.py --host codex
+python3 scripts/install_skills.py --check --host codex
+
+python3 scripts/install_skills.py --host claude
+python3 scripts/install_skills.py --check --host claude
+```
+
+重启 Codex 后使用 `$poemskills`。在 Claude Code 里用 `Skill` 工具按名字调用（`poemskills`、`poem-content` 等），文档中的 `$` 前缀是 Codex 调用语法。默认双端安装后可一起检查：
 
 ```bash
 python3 scripts/install_skills.py --check
@@ -148,6 +156,8 @@ python3 scripts/install_skills.py --check
 
 不同尺寸会重新构图，不直接裁切同一母版。
 
+确定性中文渲染目前要求 macOS，并至少安装一种系统字体：Songti SC、STHeiti 或 Arial Unicode。缺少可用中文字体时渲染会明确失败，不会静默退回可能产生方框字的默认字体。外部素材长边不得超过 8192 px，总像素不得超过 3200 万；自定义画布长边不得超过 4096 px，总像素不得超过 850 万。
+
 ## 渲染与审查
 
 渲染一个或多个 CardSpec：
@@ -216,6 +226,7 @@ PoemSkills/
 
 ```bash
 python3 scripts/test_skill_routes.py
+python3 scripts/test_install_skills.py
 python3 scripts/test_stage_contracts.py
 python3 scripts/test_layout_contracts.py
 python3 scripts/test_matrix.py

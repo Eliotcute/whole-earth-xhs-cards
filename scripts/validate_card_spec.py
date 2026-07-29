@@ -9,6 +9,8 @@ import json
 import re
 from pathlib import Path
 
+from PIL import Image
+
 
 PRIORITIES = {"aesthetic", "readable", "balanced"}
 RENDER_MODES = {"final", "draft"}
@@ -56,6 +58,11 @@ CANVAS_PRESETS = {
     "landscape-3x2": (1800, 1200),
     "custom": None,
 }
+MAX_CANVAS_EDGE = 4096
+MAX_CANVAS_PIXELS = 8_500_000
+MAX_SOURCE_IMAGE_EDGE = 8192
+MAX_SOURCE_IMAGE_PIXELS = 32_000_000
+MAX_JSON_BYTES = 1_000_000
 CLUSTER_ZONES = {
     "upper-left", "upper-center", "upper-right",
     "middle-left", "center", "middle-right",
@@ -64,6 +71,17 @@ CLUSTER_ZONES = {
 INTERSECTION_MODES = {"transparent-only", "controlled-overlap"}
 CARD_SPEC_CONTRACT = "poem-card-spec/v1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def load_bounded_json(path: Path, label: str = "JSON artifact", max_bytes: int = MAX_JSON_BYTES):
+    with path.open("rb") as handle:
+        payload = handle.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError(f"{label} exceeds the {max_bytes}-byte safety limit")
+    try:
+        return json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
 
 
 def chinese_count(value: str) -> int:
@@ -102,14 +120,14 @@ def validate_stage_ref(
     if not path.is_file():
         errors.append(f"{ref_field} does not exist: {path}")
         return path, None
+    try:
+        upstream = load_bounded_json(path, ref_field)
+    except (OSError, ValueError) as exc:
+        errors.append(f"{ref_field} is not valid JSON: {exc}")
+        return path, None
     expected_digest = file_digest(path)
     if str(cfg.get(digest_field, "")) != expected_digest:
         errors.append(f"{digest_field} is stale or belongs to a different {expected_contract}")
-    try:
-        upstream = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        errors.append(f"{ref_field} is not valid JSON: {exc}")
-        return path, None
     if not isinstance(upstream, dict):
         errors.append(f"{ref_field} must contain a JSON object")
         return path, None
@@ -232,10 +250,23 @@ def validate(
     preset = cfg.get("canvas_preset")
     if preset not in CANVAS_PRESETS:
         errors.append(f"canvas_preset must be one of {sorted(CANVAS_PRESETS)}")
-    width = int(cfg.get("width", 0))
-    height = int(cfg.get("height", 0))
-    if width <= 0 or height <= 0:
+    raw_width = cfg.get("width", 0)
+    raw_height = cfg.get("height", 0)
+    dimensions_are_integers = (
+        isinstance(raw_width, int) and not isinstance(raw_width, bool)
+        and isinstance(raw_height, int) and not isinstance(raw_height, bool)
+    )
+    width = raw_width if dimensions_are_integers else 0
+    height = raw_height if dimensions_are_integers else 0
+    if not dimensions_are_integers:
+        errors.append("width and height must be integers")
+    elif width <= 0 or height <= 0:
         errors.append("width and height must be positive integers")
+    elif width > MAX_CANVAS_EDGE or height > MAX_CANVAS_EDGE or width * height > MAX_CANVAS_PIXELS:
+        errors.append(
+            f"canvas exceeds safety limit: maximum edge {MAX_CANVAS_EDGE}px and "
+            f"maximum area {MAX_CANVAS_PIXELS} pixels"
+        )
     expected = CANVAS_PRESETS.get(preset)
     if expected and (width, height) != expected:
         errors.append(f"{preset} must use {expected[0]}x{expected[1]}; got {width}x{height}")
@@ -248,7 +279,7 @@ def validate(
             errors.append("text-only cards must use text-led-note so asset connectors are not rendered without an asset")
         if len(assets) > 2:
             errors.append("one card may use at most two visual assets")
-        for index, asset in enumerate(assets):
+        for index, asset in enumerate(assets[:2]):
             if not isinstance(asset, dict):
                 errors.append(f"assets[{index}] must be an object")
                 continue
@@ -276,6 +307,24 @@ def validate(
                 source_path = source_path if source_path.is_absolute() else base_dir / source_path
                 if not source_path.exists():
                     errors.append(f"assets[{index}].path does not exist: {source_path}")
+                elif not source_path.is_file():
+                    errors.append(f"assets[{index}].path must be an image file: {source_path}")
+                else:
+                    try:
+                        with Image.open(source_path) as source_image:
+                            source_width, source_height = source_image.size
+                        if (
+                            source_width > MAX_SOURCE_IMAGE_EDGE
+                            or source_height > MAX_SOURCE_IMAGE_EDGE
+                            or source_width * source_height > MAX_SOURCE_IMAGE_PIXELS
+                        ):
+                            errors.append(
+                                f"assets[{index}] exceeds source image safety limit: "
+                                f"maximum edge {MAX_SOURCE_IMAGE_EDGE}px and "
+                                f"maximum area {MAX_SOURCE_IMAGE_PIXELS} pixels"
+                            )
+                    except (OSError, Image.DecompressionBombError) as exc:
+                        errors.append(f"assets[{index}].path is not a safe readable image: {exc}")
             if asset_type in {"ticket", "document"}:
                 source_basis = str(asset.get("source_basis", "")).strip()
                 if not source_basis:
@@ -313,6 +362,18 @@ def validate(
     output = Path(str(cfg.get("output", "")))
     if output.suffix.casefold() != ".png":
         errors.append("output must be one independent .png file")
+    if output.is_absolute():
+        errors.append("output must be relative to the CardSpec directory")
+    if ".." in output.parts:
+        errors.append("output must not contain '..' path segments")
+    if base_dir is not None:
+        try:
+            output_root = base_dir.resolve()
+            resolved_output = (output_root / output).resolve()
+            if not resolved_output.is_relative_to(output_root):
+                errors.append("output must stay within the CardSpec directory")
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"output path cannot be resolved safely: {exc}")
     lowered_output = output.stem.casefold()
     if any(term in lowered_output for term in FORBIDDEN_OUTPUT_TERMS):
         errors.append("output name suggests a board/grid/diptych; every card or variant must be independent")
@@ -349,7 +410,12 @@ def main() -> int:
     parser.add_argument("card")
     args = parser.parse_args()
     path = Path(args.card)
-    cfg = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        cfg = load_bounded_json(path, "CardSpec")
+    except (OSError, ValueError) as exc:
+        print("INVALID")
+        print(f"- {exc}")
+        return 1
     errors = validate(cfg, path.resolve().parent, allow_legacy=args.legacy_v0_6, artifact_path=path.resolve())
     if errors:
         print("INVALID")

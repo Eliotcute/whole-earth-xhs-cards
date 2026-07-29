@@ -7,9 +7,20 @@ description: "Review PoemSkills card artifacts for source fidelity, semantic ima
 
 Decide whether rendered PoemSkills cards are publishable. Review first; revise files only when the user asks to fix or iterate, or when an end-to-end request explicitly says to complete the work to publishable status.
 
+Set `POEMSKILLS_ROOT` once before reading or running anything below. Run exactly one line matching the active host; each resolves the installed sibling `poemskills` symlink to the real repository root:
+
+```bash
+# Codex
+POEMSKILLS_ROOT="$(cd -P "${CODEX_HOME:-$HOME/.codex}/skills/poemskills" && pwd)"
+# Claude Code
+POEMSKILLS_ROOT="$(cd -P "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/poemskills" && pwd)"
+```
+
+Stop if the command fails or `test -f "$POEMSKILLS_ROOT/SKILL.md"` fails. Never infer the root from the current working directory or an unresolved `../../` path.
+
 ## Required inputs
 
-Use full-size PNGs, phone previews, CardSpecs, pixel-QA reports, and pending visual-review files. Read `../../references/visual-quality-rubric.md` completely before scoring.
+Use full-size PNGs, phone previews, CardSpecs, pixel-QA reports, and pending visual-review files. Read `$POEMSKILLS_ROOT/references/visual-quality-rubric.md` completely before scoring.
 
 ## Review order
 
@@ -38,7 +49,7 @@ For an authorized end-to-end run, repeat the owning-stage revision, render, QA, 
 Approval requires every category at least 8/10, total at least 85/100, pixel QA valid, current hashes bound, and `approved: true`.
 
 ```bash
-python3 scripts/run_pipeline.py --finalize card-01.json card-02.json
+python3 "$POEMSKILLS_ROOT/scripts/run_pipeline.py" --finalize card-01.json card-02.json
 ```
 
-Return a `poem-review-report/v1` artifact following `../../references/stage-contracts.md`, plus concise findings, revisions, final paths, and any remaining risk.
+Return a `poem-review-report/v1` artifact following `$POEMSKILLS_ROOT/references/stage-contracts.md`, plus concise findings, revisions, final paths, and any remaining risk.

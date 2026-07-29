@@ -7,7 +7,18 @@ description: "Extract a source-faithful PoemSkills content plan from long Chines
 
 Turn source material into one defensible editorial sequence. Do not design, render, or choose typography.
 
-Read `../../references/content-first-workflow.md` completely before processing a long article, transcript, or screenshot with substantial text.
+Set `POEMSKILLS_ROOT` once before reading or running anything below. Run exactly one line matching the active host; each resolves the installed sibling `poemskills` symlink to the real repository root:
+
+```bash
+# Codex
+POEMSKILLS_ROOT="$(cd -P "${CODEX_HOME:-$HOME/.codex}/skills/poemskills" && pwd)"
+# Claude Code
+POEMSKILLS_ROOT="$(cd -P "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/poemskills" && pwd)"
+```
+
+Stop if the command fails or `test -f "$POEMSKILLS_ROOT/SKILL.md"` fails. Never infer the root from the current working directory or an unresolved `../../` path.
+
+Read `$POEMSKILLS_ROOT/references/content-first-workflow.md` completely before processing a long article, transcript, or screenshot with substantial text.
 
 ## Input gate
 
@@ -52,12 +63,12 @@ Return:
 
 1. a concise readable editorial brief;
 2. the ordered card script;
-3. a `poem-content-plan/v1` JSON artifact following `../../references/stage-contracts.md`.
+3. a `poem-content-plan/v1` JSON artifact following `$POEMSKILLS_ROOT/references/stage-contracts.md`.
 
 For planning-only chat work, return the same structure inline with `status: provisional`; it may continue to title/design but cannot enter render. Write and validate a file-backed artifact when production will follow:
 
 ```bash
-python3 scripts/validate_stage_artifact.py content-plan.json --source source.txt
+python3 "$POEMSKILLS_ROOT/scripts/validate_stage_artifact.py" content-plan.json --source source.txt
 ```
 
 Do not produce final cover candidates, visual prompts, card specs, or image files. Route final cover wording to `$poem-title`.

@@ -58,9 +58,27 @@ def main() -> int:
     })
     stale_bound_spec = copy.deepcopy(bound_spec)
     stale_bound_spec["title_plan_digest"] = "missing"
+    oversized_custom = copy.deepcopy(base)
+    oversized_custom.update({"canvas_preset": "custom", "width": 100000, "height": 100000})
+    malformed_dimensions = copy.deepcopy(base)
+    malformed_dimensions.update({"canvas_preset": "custom", "width": "not-a-number", "height": 1000})
 
     with tempfile.TemporaryDirectory(prefix="poemskills-content-contract-") as raw_root:
         root = Path(raw_root)
+        outside_output = copy.deepcopy(base)
+        outside_output["output"] = "../outside.png"
+        outside_output_errors = validate(outside_output, root, allow_legacy=True)
+        absolute_output = copy.deepcopy(base)
+        absolute_output["output"] = str(root / "inside.png")
+        absolute_output_errors = validate(absolute_output, root, allow_legacy=True)
+        dotdot_output = copy.deepcopy(base)
+        dotdot_output["output"] = "nested/../inside.png"
+        dotdot_output_errors = validate(dotdot_output, root, allow_legacy=True)
+        escape_link = root / "escape"
+        escape_link.symlink_to(root.parent, target_is_directory=True)
+        symlink_output = copy.deepcopy(base)
+        symlink_output["output"] = "escape/outside.png"
+        symlink_output_errors = validate(symlink_output, root, allow_legacy=True)
         spec_path = root / "cover.json"
         spec_path.write_text(json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8")
         result = subprocess.run(
@@ -81,6 +99,12 @@ def main() -> int:
         and bool(validate(single_line, allow_legacy=True))
         and bool(validate(bound_spec))
         and bool(validate(stale_bound_spec))
+        and bool(validate(oversized_custom, allow_legacy=True))
+        and bool(validate(malformed_dimensions, allow_legacy=True))
+        and any("must not contain '..'" in error for error in outside_output_errors)
+        and any("must be relative" in error for error in absolute_output_errors)
+        and any("must not contain '..'" in error for error in dotdot_output_errors)
+        and any("must stay within" in error for error in symlink_output_errors)
         and result.returncode == 0
         and meta.get("card_role") == "cover"
         and meta.get("font_sizes", {}).get("title", 0) >= 68
@@ -97,6 +121,12 @@ def main() -> int:
         "single_line_xhs_cover_rejected": bool(validate(single_line, allow_legacy=True)),
         "v1_without_stage_refs_rejected": bool(validate(bound_spec)),
         "invalid_digest_rejected": bool(validate(stale_bound_spec)),
+        "oversized_custom_rejected": bool(validate(oversized_custom, allow_legacy=True)),
+        "malformed_dimensions_rejected": bool(validate(malformed_dimensions, allow_legacy=True)),
+        "outside_output_rejected": any("must not contain '..'" in error for error in outside_output_errors),
+        "absolute_output_rejected": any("must be relative" in error for error in absolute_output_errors),
+        "dotdot_output_rejected": any("must not contain '..'" in error for error in dotdot_output_errors),
+        "symlink_output_rejected": any("must stay within" in error for error in symlink_output_errors),
         "cover_title_px": meta.get("font_sizes", {}).get("title"),
         "thumbnail_title_px": qa.get("metrics", {}).get("thumbnail_title_px"),
     }, ensure_ascii=False, indent=2))

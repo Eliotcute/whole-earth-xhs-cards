@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,7 @@ def main() -> int:
             "paper": "pale-white-fiber",
             "accent": "blue",
             "title": title,
-            "body": "从减少一个无关入口开始管理注意力",
+            "body": "从减少一个无关入口开始\n把注意力还给真正重要的事情",
             "assets": [],
             "output": "cover.png",
         }
@@ -62,6 +63,21 @@ def main() -> int:
         qa = json.loads(qa_path.read_text(encoding="utf-8")) if qa_path.exists() else {}
 
         review_path = root / "cover.png.visual-review.json"
+        generated_paths = (
+            root / "cover.png",
+            root / "cover-preview.png",
+            root / "cover.png.layout.json",
+            qa_path,
+            review_path,
+            manifest_path,
+        )
+        generated_modes = {
+            path.name: stat.S_IMODE(path.stat().st_mode) for path in generated_paths if path.exists()
+        }
+        publish_permissions_valid = (
+            len(generated_modes) == len(generated_paths)
+            and all(mode == 0o644 for mode in generated_modes.values())
+        )
         review = json.loads(review_path.read_text(encoding="utf-8"))
         review.update({
             "status": "approved",
@@ -74,6 +90,22 @@ def main() -> int:
         layout_path = root / "cover.png.layout.json"
         original_layout = layout_path.read_text(encoding="utf-8")
         layout = json.loads(original_layout)
+        title_boxes = layout.get("title_boxes", [])
+        title_line_pitch = title_boxes[1][1] - title_boxes[0][1] if len(title_boxes) > 1 else 0
+        title_spacing_valid = title_line_pitch >= layout.get("font_sizes", {}).get("title", 0) * 1.4
+        body_boxes = layout.get("body_boxes", [])
+        body_line_pitch = body_boxes[1][1] - body_boxes[0][1] if len(body_boxes) > 1 else 0
+        body_spacing_valid = body_line_pitch >= layout.get("font_sizes", {}).get("body", 0) * 1.5
+        contrast_metrics = qa.get("metrics", {})
+        contrast_values = [contrast_metrics.get("title_contrast"), contrast_metrics.get("body_contrast")]
+        contrast_metrics_valid = (
+            all(isinstance(value, (int, float)) and value >= 4.5 for value in contrast_values)
+            and contrast_metrics.get("essential_contrast") == min(contrast_values)
+        )
+        mobile_metrics_valid = (
+            contrast_metrics.get("thumbnail_title_px", 0) >= 20
+            and contrast_metrics.get("thumbnail_body_px", 0) >= 10
+        )
         layout["tampered_after_qa"] = True
         layout_path.write_text(json.dumps(layout, ensure_ascii=False, indent=2), encoding="utf-8")
         stale_layout = run(spec, finalize=True)
@@ -93,7 +125,12 @@ def main() -> int:
         rendered.returncode == 0
         and rendered_manifest.get("contract") == "poem-artifact-manifest/v1"
         and manifest_written
+        and publish_permissions_valid
         and bool(qa.get("layout_sha256"))
+        and title_spacing_valid
+        and body_spacing_valid
+        and contrast_metrics_valid
+        and mobile_metrics_valid
         and stale_layout.returncode != 0
         and finalized.returncode == 0
         and stale_spec.returncode != 0
@@ -104,7 +141,15 @@ def main() -> int:
         "render_passed": rendered.returncode == 0,
         "stdout_is_manifest_json": rendered_manifest.get("contract") == "poem-artifact-manifest/v1",
         "manifest_written": manifest_written,
+        "generated_modes": {name: oct(mode) for name, mode in generated_modes.items()},
+        "publish_permissions_valid": publish_permissions_valid,
         "layout_bound_to_qa": bool(qa.get("layout_sha256")),
+        "title_line_pitch": title_line_pitch,
+        "title_spacing_valid": title_spacing_valid,
+        "body_line_pitch": body_line_pitch,
+        "body_spacing_valid": body_spacing_valid,
+        "contrast_metrics_valid": contrast_metrics_valid,
+        "mobile_metrics_valid": mobile_metrics_valid,
         "stale_layout_rejected": stale_layout.returncode != 0,
         "finalize_passed": finalized.returncode == 0,
         "stale_spec_rejected": stale_spec.returncode != 0,

@@ -20,6 +20,8 @@ Route each request to one specialist. For a complete production request, coordin
 
 When the user explicitly names a `$poem-*` Skill, honor that route. Keep generic Xiaohongshu title work with the user's general title tool and generic image generation with the image tool; use these specialists only for PoemSkills card work.
 
+`$name` is Codex invocation syntax. On hosts that invoke skills by bare name (for example Claude Code's `Skill` tool), read `$poem-content` as the skill `poem-content`; the `$` prefix carries no meaning there. The five specialist names are `poem-content`, `poem-title`, `poem-design`, `poem-render`, and `poem-review`.
+
 ## Coordinate complete work
 
 For “直接做成卡片”, “完整卡组”, or equivalent end-to-end requests, execute:

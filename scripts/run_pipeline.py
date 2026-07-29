@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from render_card import atomic_write_json
+from validate_card_spec import load_bounded_json
 from validate_stage_artifact import combined_digest
 
 
@@ -62,13 +64,13 @@ def write_pending_review(path: Path, image: Path, preview: Path) -> None:
         "revision_summary": "",
         "approved": False,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, payload)
 
 
 def validate_finalized_qa(qa_path: Path, spec: Path, image: Path, preview: Path, layout: Path) -> None:
     if not qa_path.exists():
         raise FileNotFoundError(f"pixel QA report is required before finalizing: {qa_path}")
-    report = json.loads(qa_path.read_text(encoding="utf-8"))
+    report = load_bounded_json(qa_path, "pixel QA report")
     if not isinstance(report, dict):
         raise ValueError(f"pixel QA report must contain a JSON object: {qa_path}")
     if report.get("valid") is not True:
@@ -103,7 +105,7 @@ def main() -> int:
             validate_command.append("--legacy-v0.6")
         validate_command.append(str(spec))
         run(validate_command)
-        cfg = json.loads(spec.read_text(encoding="utf-8"))
+        cfg = load_bounded_json(spec, "CardSpec")
         output = Path(str(cfg["output"]))
         resolved_outputs.append(output if output.is_absolute() else (spec.parent / output).resolve())
     if len(set(resolved_outputs)) != len(resolved_outputs):
@@ -113,7 +115,7 @@ def main() -> int:
 
     outputs: list[dict[str, str]] = []
     for spec in specs:
-        cfg = json.loads(spec.read_text(encoding="utf-8"))
+        cfg = load_bounded_json(spec, "CardSpec")
         output = Path(str(cfg["output"]))
         output = output if output.is_absolute() else (spec.parent / output).resolve()
         preview = output.with_name(output.stem + "-preview" + output.suffix)
@@ -161,7 +163,7 @@ def main() -> int:
         "outputs": outputs,
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(manifest_path, manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
 

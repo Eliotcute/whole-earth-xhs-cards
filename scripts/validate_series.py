@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
+
+from validate_card_spec import load_bounded_json
 
 
 def main() -> int:
@@ -13,7 +14,12 @@ def main() -> int:
         print("Usage: validate_series.py card-01.json card-02.json [...]", file=sys.stderr)
         return 2
     spec_paths = [Path(name).resolve() for name in sys.argv[1:]]
-    cards = [json.loads(path.read_text(encoding="utf-8")) for path in spec_paths]
+    try:
+        cards = [load_bounded_json(path, "CardSpec") for path in spec_paths]
+    except (OSError, ValueError) as exc:
+        print("INVALID")
+        print(f"- {exc}")
+        return 1
     errors: list[str] = []
     output_owners: dict[Path, int] = {}
     for position, (spec_path, card) in enumerate(zip(spec_paths, cards), start=1):

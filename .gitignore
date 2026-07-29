@@ -7,6 +7,7 @@ assets/e2e/*.png
 assets/e2e/*.png.layout.json
 assets/e2e/*.png.qa.json
 assets/e2e/*.png.visual-review.json
+assets/e2e/artifact-manifest.json
 *.png.asset-*.alpha.png
 
 # Temporary local output directories.

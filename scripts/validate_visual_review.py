@@ -8,6 +8,8 @@ import json
 import sys
 from pathlib import Path
 
+from validate_card_spec import load_bounded_json
+
 
 CATEGORIES = (
     "semantic_specificity",
@@ -81,7 +83,12 @@ def main() -> int:
         print("Usage: validate_visual_review.py card.png.visual-review.json", file=sys.stderr)
         return 2
     path = Path(sys.argv[1])
-    review = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        review = load_bounded_json(path, "visual review")
+    except (OSError, ValueError) as exc:
+        print("INVALID")
+        print(f"- {exc}")
+        return 1
     errors = validate(review)
     if errors:
         print("INVALID")

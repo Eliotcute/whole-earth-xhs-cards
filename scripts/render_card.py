@@ -5,18 +5,21 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
-from validate_card_spec import validate
+from validate_card_spec import MAX_SOURCE_IMAGE_EDGE, MAX_SOURCE_IMAGE_PIXELS, load_bounded_json, validate
 
 
 PAPER = (250, 250, 247)
 FIBER = (226, 225, 218)
+FIBER_DEEP = (206, 204, 194)
 INK = (17, 17, 15)
 MUTED = (86, 86, 80)
 ACCENTS = {
@@ -28,27 +31,72 @@ ACCENTS = {
     "olive": (102, 112, 68),
     "violet": (101, 86, 120),
 }
-SERIF_FONTS = [
-    "/System/Library/Fonts/Supplemental/Songti.ttc",
-    "/System/Library/Fonts/STHeiti Medium.ttc",
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-]
-SANS_FONTS = [
-    "/System/Library/Fonts/STHeiti Medium.ttc",
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-]
-MONO_FONTS = [
-    "/System/Library/Fonts/Supplemental/Courier New.ttf",
-    "/System/Library/Fonts/Supplemental/Georgia.ttf",
-]
+SONGTI = "/System/Library/Fonts/Supplemental/Songti.ttc"
+STHEITI_LIGHT = "/System/Library/Fonts/STHeiti Light.ttc"
+STHEITI_MEDIUM = "/System/Library/Fonts/STHeiti Medium.ttc"
+ARIAL_UNICODE = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+
+# Songti.ttc bundles eight faces; index 0 is Songti SC Black, which is far too
+# heavy for body copy. Select the weight explicitly so titles and body text can
+# differ by weight instead of by size alone.
+SERIF_FACES = {
+    "title": [(SONGTI, 1), (STHEITI_MEDIUM, 1), (ARIAL_UNICODE, 0)],
+    "body": [(SONGTI, 6), (STHEITI_LIGHT, 1), (ARIAL_UNICODE, 0)],
+    "support": [(SONGTI, 3), (STHEITI_LIGHT, 1), (ARIAL_UNICODE, 0)],
+}
+SANS_FACES = {
+    "title": [(STHEITI_MEDIUM, 0), (ARIAL_UNICODE, 0)],
+    "body": [(STHEITI_LIGHT, 1), (ARIAL_UNICODE, 0)],
+    "support": [(STHEITI_LIGHT, 1), (ARIAL_UNICODE, 0)],
+}
+MONO_FACES = {
+    "title": [("/System/Library/Fonts/Supplemental/Courier New.ttf", 0), ("/System/Library/Fonts/Supplemental/Georgia.ttf", 0)],
+    "body": [("/System/Library/Fonts/Supplemental/Courier New.ttf", 0), ("/System/Library/Fonts/Supplemental/Georgia.ttf", 0)],
+    "support": [("/System/Library/Fonts/Supplemental/Courier New.ttf", 0), ("/System/Library/Fonts/Supplemental/Georgia.ttf", 0)],
+}
 CLOSING_PUNCTUATION = set("，。！？；：、）》】」』’”」％%!?;:,.])}")
 
 
-def load_font(size: int, family: str = "serif") -> ImageFont.FreeTypeFont:
-    choices = SERIF_FONTS if family == "serif" else SANS_FONTS if family == "sans" else MONO_FONTS
-    for candidate in choices:
+def atomic_replace(path: Path, writer) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb") as handle:
+            writer(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_save_png(image: Image.Image, path: Path, **options) -> None:
+    atomic_replace(path, lambda handle: image.save(handle, format="PNG", **options))
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    atomic_replace(path, lambda handle: handle.write(encoded))
+
+
+def load_font(size: int, family: str = "serif", weight: str = "body") -> ImageFont.FreeTypeFont:
+    table = SERIF_FACES if family == "serif" else SANS_FACES if family == "sans" else MONO_FACES
+    for candidate, index in table.get(weight, table["body"]):
         if Path(candidate).exists():
-            return ImageFont.truetype(candidate, size=max(8, int(size)), index=0)
+            try:
+                return ImageFont.truetype(candidate, size=max(8, int(size)), index=index)
+            except OSError:
+                continue
+    if family in {"serif", "sans"}:
+        raise RuntimeError(
+            f"No usable CJK-capable {family} font is installed; "
+            "PoemSkills requires Songti SC, STHeiti, or Arial Unicode"
+        )
     return ImageFont.load_default(size=max(8, int(size)))
 
 
@@ -127,26 +175,109 @@ def draw_text_block(draw, xy, text, face, fill, max_width, line_gap, max_lines=N
     return y, boxes
 
 
+def typography_sizes(cfg: dict) -> tuple[int, int, int]:
+    width = int(cfg["width"])
+    base = width / 1242
+    priority = cfg.get("priority", "balanced")
+    if cfg["card_role"] == "cover":
+        title_px = int((88 if priority == "readable" else 82 if priority == "balanced" else 72) * max(0.72, base))
+        body_px = int((44 if priority == "readable" else 40 if priority == "balanced" else 36) * max(0.72, base))
+    else:
+        title_px = int((58 if priority == "readable" else 52 if priority == "balanced" else 48) * max(0.72, base))
+        body_px = int((38 if priority == "readable" else 34 if priority == "balanced" else 34) * max(0.72, base))
+    micro_px = max(15, int(23 * max(0.68, base)))
+    return title_px, body_px, micro_px
+
+
+def build_copy_layer(
+    cfg: dict, tx: int, ty: int, title_width: int, body_width: int,
+    title_limit: int, body_limit: int, title_font=None, body_font=None,
+) -> tuple[Image.Image, list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]:
+    width, height = int(cfg["width"]), int(cfg["height"])
+    short = min(width, height)
+    margin = int(short * 0.062)
+    title_px, body_px, _ = typography_sizes(cfg)
+    title_font = title_font or load_font(title_px, "serif", "title")
+    body_font = body_font or load_font(body_px, "serif", "body")
+    title_gap = int(title_px * 0.52)
+    body_gap = int(body_px * 0.62)
+    inter_gap = max(int(body_px * 0.45), int(short * 0.012))
+    available_top = int(height * 0.10) if cfg.get("canvas_preset") == "portrait-9x16" else margin
+    available_bottom = int(height * 0.88) if cfg.get("canvas_preset") == "portrait-9x16" else height - margin
+
+    def draw_on_layer(start_y):
+        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        layer_draw = ImageDraw.Draw(layer, "RGBA")
+        _, measured_title = draw_text_block(
+            layer_draw, (tx, start_y), cfg["title"], title_font, INK,
+            title_width, title_gap, title_limit,
+        )
+        body_y = max([box[3] for box in measured_title] or [start_y]) + inter_gap
+        _, measured_body = draw_text_block(
+            layer_draw, (tx, body_y), cfg["body"], body_font, MUTED,
+            body_width, body_gap, body_limit,
+        )
+        return layer, measured_title, measured_body
+
+    text_layer, title_boxes, body_boxes = draw_on_layer(ty)
+    essential = title_boxes + body_boxes
+    if essential:
+        min_y = min(box[1] for box in essential)
+        max_y = max(box[3] for box in essential)
+        shift_y = 0
+        if max_y > available_bottom:
+            shift_y = available_bottom - max_y
+        if min_y + shift_y < available_top:
+            shift_y += available_top - (min_y + shift_y)
+        if shift_y:
+            text_layer, title_boxes, body_boxes = draw_on_layer(ty + shift_y)
+        final_essential = title_boxes + body_boxes
+        final_max_y = max(box[3] for box in final_essential)
+        if final_max_y > available_bottom:
+            final_shift = available_bottom - final_max_y
+            shifted_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            shifted_layer.alpha_composite(text_layer, (0, final_shift))
+            text_layer = shifted_layer
+            title_boxes = [(x0, y0 + final_shift, x1, y1 + final_shift) for x0, y0, x1, y1 in title_boxes]
+            body_boxes = [(x0, y0 + final_shift, x1, y1 + final_shift) for x0, y0, x1, y1 in body_boxes]
+    return text_layer, title_boxes, body_boxes
+
+
 def make_paper(width: int, height: int, seed: int) -> Image.Image:
     rng = random.Random(seed)
     img = Image.new("RGB", (width, height), PAPER)
     d = ImageDraw.Draw(img, "RGBA")
     area_scale = max(1, width * height // 50000)
-    for _ in range(area_scale * 26):
+    # Papyrus fibers must be visible on close inspection while keeping texture
+    # contrast under the ~4% ceiling in references/style-system.md.
+    for _ in range(area_scale * 58):
         x = rng.randrange(width)
         y = rng.randrange(height)
-        length = rng.randint(max(3, width // 250), max(8, width // 55))
-        alpha = rng.randint(4, 11)
-        if rng.random() < 0.65:
-            d.line((x, y, min(width, x + length), y + rng.choice([-1, 0, 1])), fill=(*FIBER, alpha), width=1)
+        # Skewed length distribution: mostly short flecks, occasionally long
+        # strands, so the weave never reads as a regular grid.
+        length = int(rng.triangular(max(4, width // 220), max(26, width // 20), max(7, width // 120)))
+        alpha = rng.randint(12, 28)
+        drift = rng.choice([-2, -1, 0, 0, 1, 2])
+        if rng.random() < 0.62:
+            d.line((x, y, min(width, x + length), y + drift), fill=(*FIBER_DEEP, alpha), width=1)
         else:
-            d.line((x, y, x + rng.choice([-1, 0, 1]), min(height, y + length)), fill=(*FIBER, alpha), width=1)
-    noise = Image.effect_noise((width, height), 3.0).convert("L")
-    noise = ImageEnhance.Contrast(noise).enhance(0.22)
-    veil = Image.new("RGB", (width, height), PAPER)
-    veil.putalpha(noise.point(lambda value: max(0, min(10, int(value * 0.035)))))
-    img = Image.alpha_composite(img.convert("RGBA"), veil).convert("RGB")
-    return img
+            d.line((x, y, x + drift, min(height, y + length)), fill=(*FIBER_DEEP, alpha), width=1)
+    # Sparse longer strands read as cross-woven papyrus rather than uniform noise.
+    for _ in range(area_scale * 3):
+        x = rng.randrange(width)
+        y = rng.randrange(height)
+        length = rng.randint(max(20, width // 20), max(40, width // 9))
+        alpha = rng.randint(10, 20)
+        if rng.random() < 0.5:
+            d.line((x, y, min(width, x + length), y + rng.choice([-1, 0, 1])), fill=(*FIBER_DEEP, alpha), width=1)
+        else:
+            d.line((x, y, x + rng.choice([-1, 0, 1]), min(height, y + length)), fill=(*FIBER_DEEP, alpha), width=1)
+    channels = img.split()
+    bounded_channels = tuple(
+        channel.point(lambda value, base=base: max(base - 10, min(base + 10, value)))
+        for channel, base in zip(channels, PAPER)
+    )
+    return Image.merge("RGB", bounded_channels)
 
 
 def asset_path(asset: dict, spec_path: Path) -> Path | None:
@@ -157,8 +288,19 @@ def asset_path(asset: dict, spec_path: Path) -> Path | None:
     return path if path.is_absolute() else (spec_path.parent / path).resolve()
 
 
+def open_source_image(path: Path, mode: str) -> Image.Image:
+    with Image.open(path) as source:
+        width, height = source.size
+        if width > MAX_SOURCE_IMAGE_EDGE or height > MAX_SOURCE_IMAGE_EDGE or width * height > MAX_SOURCE_IMAGE_PIXELS:
+            raise ValueError(
+                f"Source image exceeds safety limit: maximum edge {MAX_SOURCE_IMAGE_EDGE}px "
+                f"and maximum area {MAX_SOURCE_IMAGE_PIXELS} pixels"
+            )
+        return source.convert(mode)
+
+
 def process_photo(path: Path, size: tuple[int, int], paper: tuple[int, int, int]) -> Image.Image:
-    im = Image.open(path).convert("RGB")
+    im = open_source_image(path, "RGB")
     im = ImageOps.fit(im, size, method=Image.Resampling.LANCZOS)
     im = ImageOps.grayscale(im)
     im = ImageEnhance.Contrast(im).enhance(1.18)
@@ -167,7 +309,7 @@ def process_photo(path: Path, size: tuple[int, int], paper: tuple[int, int, int]
 
 
 def process_cutout(path: Path, size: tuple[int, int], color=INK) -> Image.Image:
-    im = Image.open(path).convert("RGBA")
+    im = open_source_image(path, "RGBA")
     if im.getextrema()[3] == (255, 255):
         gray = ImageOps.grayscale(im.convert("RGB"))
         gray = ImageOps.autocontrast(gray, cutoff=1)
@@ -307,8 +449,153 @@ def place_two_columns(zone: str, width: int, margin: int, gap: int, asset_width:
     return margin, width - margin - asset_width, text_width
 
 
+def landscape_connector(cfg: dict, title_px: int) -> tuple[int, int, int, int] | None:
+    width, height = int(cfg["width"]), int(cfg["height"])
+    layout = cfg.get("layout", "quiet-specimen")
+    if width <= height or layout not in {"archive-collage", "relief-emblem", "quiet-specimen"}:
+        return None
+    short = min(width, height)
+    margin = int(short * 0.062)
+    gap = max(margin, int(short * 0.045))
+    wide_short = height / width < 0.58
+    asset_w = int(width * (0.25 if not wide_short else 0.20))
+    asset_h = int(height * (0.50 if not wide_short else 0.56))
+    preferred_text_w = int(width * 0.38)
+    tx, ax, _ = place_two_columns(cfg.get("cluster_zone", "center"), width, margin, gap, asset_w, preferred_text_w)
+    ay = layout_anchor(cfg.get("cluster_zone", "center"), width, height, asset_w, asset_h, margin)[1]
+    ty = max(margin, int(height * 0.31))
+    return ax + asset_w // 2, ay + asset_h // 2, tx, ty + title_px
+
+
+def canonical_asset_plan(
+    cfg: dict, text_above_bottom: int | None = None,
+) -> list[tuple[tuple[int, int, int, int], int]]:
+    width, height = int(cfg["width"]), int(cfg["height"])
+    short = min(width, height)
+    margin = int(short * 0.062)
+    landscape = width > height
+    wide_short = landscape and height / width < 0.58
+    layout = cfg.get("layout", "quiet-specimen")
+    zone = cfg.get("cluster_zone", "center")
+    asset_count = len(cfg.get("assets", []))
+    title_px, _, _ = typography_sizes(cfg)
+    plan: list[tuple[tuple[int, int, int, int], int]] = []
+
+    def add(x: int, y: int, box_width: int, box_height: int, opacity: int = 255) -> None:
+        if len(plan) < asset_count:
+            plan.append(((x, y, x + box_width, y + box_height), opacity))
+
+    def portrait_position(box_width: int, box_height: int, default_right: bool = False):
+        centered = zone == "center" or zone.endswith("center")
+        on_right = zone.endswith("right") or (centered and default_right)
+        x = width - margin - box_width if on_right else margin
+        y = layout_anchor(zone, width, height, box_width, box_height, margin)[1]
+        return x, y, on_right
+
+    if layout in {"image-above", "text-above"}:
+        cluster_width = int(width * (0.52 if landscape else 0.66))
+        asset_width = int(width * (0.38 if landscape else 0.52))
+        asset_height = int(height * (0.34 if landscape else 0.25))
+        if zone.endswith("left"):
+            text_x = margin
+        elif zone.endswith("right"):
+            text_x = width - margin - cluster_width
+        else:
+            text_x = (width - cluster_width) // 2
+        asset_x = text_x + (cluster_width - asset_width) // 2
+        vertical_gap = max(int(height * 0.055), int(title_px * 0.9))
+        if layout == "image-above":
+            asset_y = max(margin, int(height * (0.10 if landscape else 0.16)))
+        else:
+            if text_above_bottom is None:
+                text_y = max(margin, int(height * (0.10 if landscape else 0.16)))
+                _, title_boxes, body_boxes = build_copy_layer(
+                    cfg, text_x, text_y, cluster_width, int(cluster_width * 0.92), 4, 7,
+                )
+                text_above_bottom = max(box[3] for box in title_boxes + body_boxes)
+            asset_y = min(height - margin - asset_height, text_above_bottom + vertical_gap)
+        add(asset_x, asset_y, asset_width, asset_height)
+        add(
+            asset_x + int(asset_width * 0.66), asset_y + int(asset_height * 0.66),
+            int(asset_width * 0.32), int(asset_height * 0.30), 180,
+        )
+        return plan
+
+    if landscape:
+        gap = max(margin, int(short * 0.045))
+        asset_width = int(width * (0.20 if wide_short else 0.25))
+        asset_height = int(height * (0.56 if wide_short else 0.50))
+        preferred_text_width = int(width * (0.43 if layout == "text-led-note" else 0.38))
+        text_x, asset_x, _ = place_two_columns(
+            zone, width, margin, gap, asset_width, preferred_text_width,
+        )
+        asset_y = layout_anchor(zone, width, height, asset_width, asset_height, margin)[1]
+        text_y = max(margin, int(height * (0.25 if layout == "text-led-note" else 0.31)))
+        if layout == "text-led-note":
+            asset_width, asset_height = int(asset_width * 0.45), int(asset_height * 0.52)
+            asset_x = width - margin - asset_width if text_x < width // 2 else margin
+            asset_y = min(height - margin - asset_height, text_y + int(title_px * 1.2))
+        add(asset_x, asset_y, asset_width, asset_height)
+        add(
+            asset_x + asset_width // 2, asset_y + asset_height // 2,
+            asset_width // 2, asset_height // 2, 190,
+        )
+        return plan
+
+    if layout == "archive-collage":
+        asset_width, asset_height = int(width * 0.46), int(height * 0.37)
+        asset_x, asset_y, _ = portrait_position(asset_width, asset_height)
+        add(asset_x, asset_y, asset_width, asset_height)
+        second_width, second_height = int(asset_width * 0.54), int(asset_height * 0.43)
+        add(
+            asset_x + int(asset_width * 0.06),
+            min(height - margin - second_height, asset_y + int(asset_height * 0.78)),
+            second_width, second_height, 225,
+        )
+    elif layout == "relief-emblem":
+        asset_width, asset_height = int(width * 0.44), int(height * 0.35)
+        asset_x, asset_y, _ = portrait_position(asset_width, asset_height, default_right=True)
+        add(asset_x, asset_y, asset_width, asset_height)
+        add(
+            asset_x + int(asset_width * 0.60), asset_y + int(asset_height * 0.62),
+            int(asset_width * 0.42), int(asset_height * 0.32), 190,
+        )
+    elif layout == "silhouette-field":
+        asset_width, asset_height = int(width * 0.36), int(height * 0.29)
+        asset_x, asset_y, _ = portrait_position(asset_width, asset_height, default_right=True)
+        add(asset_x, asset_y, asset_width, asset_height)
+        add(
+            asset_x - int(asset_width * 0.10), asset_y + int(asset_height * 0.52),
+            int(asset_width * 0.55), int(asset_height * 0.42), 145,
+        )
+    elif layout == "text-led-note":
+        text_width = int(width * 0.58)
+        text_x = margin * 2 if not zone.endswith("right") else width - margin * 2 - text_width
+        text_y = max(
+            margin * 3,
+            int(height * (0.28 if zone.startswith("upper") else 0.36 if zone.startswith("middle") or zone == "center" else 0.48)),
+        )
+        asset_width, asset_height = int(width * 0.16), int(height * 0.12)
+        asset_x = width - margin - asset_width if text_x < width // 2 else margin
+        asset_y = min(height - margin - asset_height, text_y + int(height * 0.36))
+        add(asset_x, asset_y, asset_width, asset_height)
+        add(
+            asset_x + asset_width // 2, asset_y + asset_height // 2,
+            asset_width // 2, asset_height // 2, 175,
+        )
+    else:
+        asset_width, asset_height = int(width * 0.29), int(height * 0.24)
+        asset_x, asset_y, _ = portrait_position(asset_width, asset_height)
+        add(asset_x, asset_y, asset_width, asset_height)
+        add(
+            asset_x + int(asset_width * 0.68), asset_y + int(asset_height * 0.62),
+            int(asset_width * 0.38), int(asset_height * 0.34), 175,
+        )
+    return plan
+
+
 def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
-    cfg = json.loads(spec_path.read_text(encoding="utf-8"))
+    cfg = load_bounded_json(spec_path, "CardSpec")
     validation_errors = validate(cfg, spec_path.parent, allow_legacy=allow_legacy, artifact_path=spec_path)
     if validation_errors:
         raise ValueError("Invalid card specification:\n- " + "\n- ".join(validation_errors))
@@ -322,21 +609,15 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
     margin = int(short * 0.062)
     safe = (margin, margin, width - margin, height - margin)
     landscape = width > height
-    base = short / 1242 if not landscape else short / 900
     priority = cfg.get("priority", "balanced")
     render_mode = cfg.get("render_mode", "final")
     card_role = cfg["card_role"]
-    if card_role == "cover":
-        title_px = int((88 if priority == "readable" else 82 if priority == "balanced" else 72) * max(0.72, base))
-        body_px = int((44 if priority == "readable" else 40 if priority == "balanced" else 36) * max(0.72, base))
-    else:
-        title_px = int((58 if priority == "readable" else 52 if priority == "balanced" else 48) * max(0.72, base))
-        body_px = int((38 if priority == "readable" else 34 if priority == "balanced" else 34) * max(0.72, base))
-    micro_px = max(15, int(23 * max(0.68, base)))
-    title_font = load_font(title_px, "serif")
-    body_font = load_font(body_px, "serif")
+    title_px, body_px, micro_px = typography_sizes(cfg)
+    title_font = load_font(title_px, "serif", "title")
+    body_font = load_font(body_px, "serif", "body")
     micro_font = load_font(micro_px, "mono")
-    title_boxes, body_boxes, micro_boxes, asset_boxes, asset_opaque_boxes, asset_alpha_paths = [], [], [], [], [], []
+    title_boxes, body_boxes, micro_boxes = [], [], []
+    asset_boxes, asset_opaque_boxes, asset_alpha_paths, asset_opacities = [], [], [], []
     layout = cfg.get("layout", "quiet-specimen")
     zone = cfg.get("cluster_zone", "center")
     assets = cfg.get("assets", [])
@@ -359,47 +640,10 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
 
     def draw_copy(tx, ty, title_width, body_width, title_limit=4, body_limit=8):
         nonlocal title_boxes, body_boxes
-        title_gap = int(title_px * 0.42)
-        body_gap = int(body_px * 0.45)
-        inter_gap = max(int(body_px * 0.45), int(short * 0.012))
-        available_top = int(height * 0.10) if cfg.get("canvas_preset") == "portrait-9x16" else margin
-        available_bottom = int(height * 0.88) if cfg.get("canvas_preset") == "portrait-9x16" else height - margin
-
-        def draw_on_layer(start_y):
-            layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            layer_draw = ImageDraw.Draw(layer, "RGBA")
-            _, measured_title = draw_text_block(
-                layer_draw, (tx, start_y), cfg["title"], title_font, INK,
-                title_width, title_gap, title_limit,
-            )
-            body_y = max([box[3] for box in measured_title] or [start_y]) + inter_gap
-            _, measured_body = draw_text_block(
-                layer_draw, (tx, body_y), cfg["body"], body_font, INK,
-                body_width, body_gap, body_limit,
-            )
-            return layer, measured_title, measured_body
-
-        text_layer, title_boxes, body_boxes = draw_on_layer(ty)
-        essential = title_boxes + body_boxes
-        if essential:
-            min_y = min(box[1] for box in essential)
-            max_y = max(box[3] for box in essential)
-            shift_y = 0
-            if max_y > available_bottom:
-                shift_y = available_bottom - max_y
-            if min_y + shift_y < available_top:
-                shift_y += available_top - (min_y + shift_y)
-            if shift_y:
-                text_layer, title_boxes, body_boxes = draw_on_layer(ty + shift_y)
-            final_essential = title_boxes + body_boxes
-            final_max_y = max(box[3] for box in final_essential)
-            if final_max_y > available_bottom:
-                final_shift = available_bottom - final_max_y
-                shifted_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-                shifted_layer.alpha_composite(text_layer, (0, final_shift))
-                text_layer = shifted_layer
-                title_boxes = [(x0, y0 + final_shift, x1, y1 + final_shift) for x0, y0, x1, y1 in title_boxes]
-                body_boxes = [(x0, y0 + final_shift, x1, y1 + final_shift) for x0, y0, x1, y1 in body_boxes]
+        text_layer, title_boxes, body_boxes = build_copy_layer(
+            cfg, tx, ty, title_width, body_width, title_limit, body_limit,
+            title_font=title_font, body_font=body_font,
+        )
         img.alpha_composite(text_layer)
         return max([box[3] for box in title_boxes + body_boxes] or [ty])
 
@@ -425,8 +669,14 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
             output = (spec_path.parent / output).resolve()
         alpha_path = output.with_suffix(output.suffix + f".asset-{index}.alpha.png")
         alpha_path.parent.mkdir(parents=True, exist_ok=True)
-        asset_im.getchannel("A").save(alpha_path)
+        atomic_save_png(asset_im.getchannel("A"), alpha_path)
         asset_alpha_paths.append(str(alpha_path))
+        asset_opacities.append(opacity)
+
+    def paste_canonical_assets(text_above_bottom=None):
+        for index, (asset_box, opacity) in enumerate(canonical_asset_plan(cfg, text_above_bottom)):
+            left, top, right, bottom = asset_box
+            paste_asset(index, (left, top, right - left, bottom - top), opacity)
 
     def portrait_asset_position(box_w: int, box_h: int, default_right: bool = False):
         centered = zone == "center" or zone.endswith("center")
@@ -449,17 +699,13 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         gap_y = max(int(height * 0.055), int(title_px * 0.9))
         if layout == "image-above":
             ay = max(margin, int(height * (0.10 if landscape else 0.16)))
-            paste_asset(0, (ax, ay, asset_w, asset_h))
-            if len(assets) > 1:
-                paste_asset(1, (ax + int(asset_w * 0.66), ay + int(asset_h * 0.66), int(asset_w * 0.32), int(asset_h * 0.30)), 180)
+            paste_canonical_assets()
             draw_copy(tx, ay + asset_h + gap_y, cluster_w, int(cluster_w * 0.92), 4, 7)
         else:
             ty = max(margin, int(height * (0.10 if landscape else 0.16)))
             text_bottom = draw_copy(tx, ty, cluster_w, int(cluster_w * 0.92), 4, 7)
             ay = min(height - margin - asset_h, text_bottom + gap_y)
-            paste_asset(0, (ax, ay, asset_w, asset_h))
-            if len(assets) > 1:
-                paste_asset(1, (ax + int(asset_w * 0.66), ay + int(asset_h * 0.66), int(asset_w * 0.32), int(asset_h * 0.30)), 180)
+            paste_canonical_assets(text_bottom)
     elif landscape:
         asset_w = int(width * (0.25 if not wide_short else 0.20))
         asset_h = int(height * (0.50 if not wide_short else 0.56))
@@ -471,24 +717,18 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
             asset_w, asset_h = int(asset_w * 0.45), int(asset_h * 0.52)
             ax = width - margin - asset_w if tx < width // 2 else margin
             ay = min(height - margin - asset_h, ty + int(title_px * 1.2))
-        paste_asset(0, (ax, ay, asset_w, asset_h))
-        if len(assets) > 1:
-            paste_asset(1, (ax + asset_w // 2, ay + asset_h // 2, asset_w // 2, asset_h // 2), 190)
+        paste_canonical_assets()
         draw_copy(tx, ty, text_w, int(text_w * 0.94), 4, 7)
-        if layout in {"archive-collage", "relief-emblem", "quiet-specimen"}:
-            d.line((ax + asset_w // 2, ay + asset_h // 2, tx, ty + title_px), fill=(*MUTED, 105), width=1)
+        connector = landscape_connector(cfg, title_px)
+        if connector is not None:
+            d.line(connector, fill=(*MUTED, 105), width=1)
     elif layout == "archive-collage":
         asset_w, asset_h = int(width * 0.46), int(height * 0.37)
         ax, ay, asset_on_right = portrait_asset_position(asset_w, asset_h)
         text_w = int(width * 0.34)
         tx = margin if asset_on_right else width - margin - text_w
         ty = max(margin * 2, ay + int(asset_h * 0.17))
-        paste_asset(0, (ax, ay, asset_w, asset_h))
-        if len(assets) > 1:
-            second_w, second_h = int(asset_w * 0.54), int(asset_h * 0.43)
-            second_x = ax + int(asset_w * 0.06)
-            second_y = min(height - margin - second_h, ay + int(asset_h * 0.78))
-            paste_asset(1, (second_x, second_y, second_w, second_h), 225)
+        paste_canonical_assets()
         draw_copy(tx, ty, text_w, int(text_w * 0.96), 4, 8)
         rule_y = min(height - margin, ty + int(asset_h * 0.66))
         d.line((tx, rule_y, tx + text_w, rule_y), fill=(*MUTED, 120), width=1)
@@ -498,9 +738,7 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         text_w = int(width * 0.35)
         tx = margin if asset_on_right else width - margin - text_w
         ty = max(margin * 2, ay + int(asset_h * 0.22))
-        paste_asset(0, (ax, ay, asset_w, asset_h))
-        if len(assets) > 1:
-            paste_asset(1, (ax + int(asset_w * 0.60), ay + int(asset_h * 0.62), int(asset_w * 0.42), int(asset_h * 0.32)), 190)
+        paste_canonical_assets()
         draw_copy(tx, ty, text_w, int(text_w * 0.95), 4, 8)
         line_start = ax + asset_w if ax < tx else ax
         line_end = tx if ax < tx else tx + text_w
@@ -511,9 +749,7 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         text_w = int(width * 0.46)
         tx = margin if asset_on_right else width - margin - text_w
         ty = max(margin * 2, ay + int(asset_h * 0.10))
-        paste_asset(0, (ax, ay, asset_w, asset_h))
-        if len(assets) > 1:
-            paste_asset(1, (ax - int(asset_w * 0.10), ay + int(asset_h * 0.52), int(asset_w * 0.55), int(asset_h * 0.42)), 145)
+        paste_canonical_assets()
         draw_copy(tx, ty, text_w, int(text_w * 0.92), 4, 8)
         for index, (dx, dy) in enumerate(((0.10, 1.06), (0.52, 1.15), (0.92, 1.02))):
             cx, cy = ax + int(asset_w * dx), ay + int(asset_h * dy)
@@ -527,9 +763,7 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         small_w, small_h = int(width * 0.16), int(height * 0.12)
         sx = width - margin - small_w if tx < width // 2 else margin
         sy = min(height - margin - small_h, ty + int(height * 0.36))
-        paste_asset(0, (sx, sy, small_w, small_h))
-        if len(assets) > 1:
-            paste_asset(1, (sx + small_w // 2, sy + small_h // 2, small_w // 2, small_h // 2), 175)
+        paste_canonical_assets()
         slash_x = tx + int(text_w * 0.78)
         slash_y = min(height - margin * 2, ty + int(height * 0.36))
         d.line((slash_x, slash_y, slash_x + int(short * 0.035), slash_y - int(short * 0.075)), fill=(*INK, 155), width=1)
@@ -539,9 +773,7 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         text_w = int(width * 0.43)
         tx = margin if asset_on_right else width - margin - text_w
         ty = max(margin * 2, ay + int(asset_h * 0.16))
-        paste_asset(0, (ax, ay, asset_w, asset_h))
-        if len(assets) > 1:
-            paste_asset(1, (ax + int(asset_w * 0.68), ay + int(asset_h * 0.62), int(asset_w * 0.38), int(asset_h * 0.34)), 175)
+        paste_canonical_assets()
         draw_copy(tx, ty, text_w, int(text_w * 0.94), 4, 8)
         line_start = ax + asset_w if ax < tx else ax
         line_end = tx if ax < tx else tx + text_w
@@ -569,8 +801,7 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
     output = Path(cfg["output"])
     if not output.is_absolute():
         output = (spec_path.parent / output).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    img.convert("RGB").save(output, quality=96)
+    atomic_save_png(img.convert("RGB"), output, quality=96)
     meta = {
         "canvas": {"width": width, "height": height, "preset": cfg["canvas_preset"]},
         "safe_area": safe,
@@ -581,6 +812,8 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         "asset_count": len(assets),
         "accent": cfg.get("accent", "blue"),
         "accent_rgb": accent,
+        "paper_color": PAPER,
+        "text_colors": {"title": INK, "body": MUTED},
         "font_sizes": {"title": title_px, "body": body_px, "micro": micro_px},
         "title_boxes": title_boxes,
         "body_boxes": body_boxes,
@@ -588,10 +821,11 @@ def render(spec_path: Path, allow_legacy: bool = False) -> tuple[Path, Path]:
         "asset_boxes": asset_boxes,
         "asset_opaque_boxes": asset_opaque_boxes,
         "asset_alpha_paths": asset_alpha_paths,
+        "asset_opacities": asset_opacities,
         "output": str(output),
     }
     meta_path = output.with_suffix(output.suffix + ".layout.json")
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(meta_path, meta)
     return output, meta_path
 
 

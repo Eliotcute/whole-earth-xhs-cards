@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 from validate_visual_review import CATEGORIES, validate
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def digest(path: Path) -> str:
@@ -27,6 +32,20 @@ def review(score: float, image: Path, preview: Path, approved: bool = True) -> d
         "revision_summary": "检查完整图片和手机预览，并修正最弱的构图关系。",
         "approved": approved,
     }
+
+
+def invalid_json_rejected(path: Path) -> bool:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "validate_visual_review.py"), str(path)],
+        text=True,
+        capture_output=True,
+    )
+    combined_output = result.stdout + result.stderr
+    return (
+        result.returncode == 1
+        and result.stdout.startswith("INVALID\n- ")
+        and "Traceback" not in combined_output
+    )
 
 
 def main() -> int:
@@ -48,6 +67,14 @@ def main() -> int:
         image.write_bytes(b"changed")
         stale_errors = validate(stale)
         image.write_bytes(b"image")
+        missing_path = root / "missing.json"
+        malformed_path = root / "malformed.json"
+        malformed_path.write_text("{", encoding="utf-8")
+        oversized_path = root / "oversized.json"
+        oversized_path.write_bytes(b" " * 1_000_001)
+        missing_json_rejected = invalid_json_rejected(missing_path)
+        malformed_json_rejected = invalid_json_rejected(malformed_path)
+        oversized_json_rejected = invalid_json_rejected(oversized_path)
 
         valid = (
             bool(validate([]))
@@ -58,6 +85,9 @@ def main() -> int:
             and bool(validate(pending_but_approved))
             and bool(validate(wrong_lowest))
             and bool(stale_errors)
+            and missing_json_rejected
+            and malformed_json_rejected
+            and oversized_json_rejected
         )
         print(json.dumps({
             "valid": valid,
@@ -69,6 +99,9 @@ def main() -> int:
             "pending_status_rejected": bool(validate(pending_but_approved)),
             "wrong_lowest_rejected": bool(validate(wrong_lowest)),
             "stale_review_rejected": bool(stale_errors),
+            "missing_json_rejected_without_traceback": missing_json_rejected,
+            "malformed_json_rejected_without_traceback": malformed_json_rejected,
+            "oversized_json_rejected_without_traceback": oversized_json_rejected,
         }, ensure_ascii=False, indent=2))
         return 0 if valid else 1
 

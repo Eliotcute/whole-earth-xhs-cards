@@ -7,6 +7,17 @@ description: "Render validated PoemSkills CardSpec JSON files into independent P
 
 Render approved CardSpecs. Own mechanical composition and export correctness, not editorial or art-direction decisions.
 
+Set `POEMSKILLS_ROOT` once before reading or running anything below. Run exactly one line matching the active host; each resolves the installed sibling `poemskills` symlink to the real repository root:
+
+```bash
+# Codex
+POEMSKILLS_ROOT="$(cd -P "${CODEX_HOME:-$HOME/.codex}/skills/poemskills" && pwd)"
+# Claude Code
+POEMSKILLS_ROOT="$(cd -P "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/poemskills" && pwd)"
+```
+
+Stop if the command fails or `test -f "$POEMSKILLS_ROOT/SKILL.md"` fails. Never infer the root from the current working directory or an unresolved `../../` path.
+
 ## Input gate
 
 Accept one or more validated CardSpec JSON files. Reject raw long text, an unapproved title, or a visual idea without specs; route those to `$poemskills` for coordination.
@@ -18,13 +29,13 @@ Accept legacy v0.6 specs only when the user explicitly requests the legacy adapt
 Run:
 
 ```bash
-python3 scripts/run_pipeline.py card-01.json card-02.json
+python3 "$POEMSKILLS_ROOT/scripts/run_pipeline.py" card-01.json card-02.json
 ```
 
 Legacy adapter:
 
 ```bash
-python3 scripts/run_pipeline.py --legacy-v0.6 old-card.json
+python3 "$POEMSKILLS_ROOT/scripts/run_pipeline.py" --legacy-v0.6 old-card.json
 ```
 
 This validates each spec, validates series rhythm, renders independent PNGs, creates phone previews and layout manifests, runs pixel QA, creates pending visual-review files, and writes `artifact-manifest.json` beside the first CardSpec. Use `--manifest PATH` to choose another destination. Successful stdout contains only the manifest JSON.
@@ -41,6 +52,6 @@ If rendering reveals an editorial or asset problem, stop and route it to the own
 
 ## Deliver
 
-Return an `ArtifactManifest` containing every spec, image, preview, pixel-QA report, layout manifest, and pending visual-review path. Include SHA-256 digests for QA, layout, and visual-review evidence. Follow `../../references/stage-contracts.md` and bind the manifest to the exact CardSpec files.
+Return an `ArtifactManifest` containing every spec, image, preview, pixel-QA report, layout manifest, and pending visual-review path. Include SHA-256 digests for QA, layout, and visual-review evidence. Follow `$POEMSKILLS_ROOT/references/stage-contracts.md` and bind the manifest to the exact CardSpec files.
 
 Generated files are candidates, not deliverables. Route them to `$poem-review`.
